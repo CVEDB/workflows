@@ -1,0 +1,117 @@
+# Trigger the execution of copy workflow in batches.
+# This workflow is needed since GitHub Actions limits the matrix size to 256 jobs.
+# We use one job per repository per batch.
+
+name: Dispatch
+
+on:
+  push:
+    branches: [ master, testing ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Number of repositories in a batch.
+  # Matrix jobs within a copy workflow run are run in parallel.
+  # 256 is the upper limit on the number of matrix jobs.
+  # Batching too many repositories together can result in
+  #  could not create workflow dispatch event: HTTP 422: inputs are too large.
+  # This value should be higher than max-parallel in copy workflow.
+  MAX_REPOS_PER_WORKFLOW: 100
+  # Number of seconds to wait before starting to watch copy workflow run.
+  # Unfortunately, the interval on the watch is not configurable.
+  # The delay helps us save on GH API requests.
+  WORKFLOW_COMPLETION_CHECK_DELAY: 60
+
+jobs:
+  matrix:
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/testing'
+    name: Batch targets
+    runs-on: ubuntu-latest
+    outputs:
+      batches: ${{ steps.set-matrix.outputs.batches }}
+    steps:
+      - uses: actions/checkout@v3
+      - id: set-matrix
+        run: |
+          targets=()
+          for config in configs/*.json; do
+            if [[ $GITHUB_REF == refs/heads/testing && $config != configs/testing.json ]]; then
+              continue
+            fi
+            if [[ $GITHUB_REF != refs/heads/testing && $config == configs/testing.json ]]; then
+              continue
+            fi
+            echo "::group::$config"
+            defaults=$(jq -c '.defaults' $config)
+            # values defined in the repository object will override the default values
+            # e.g. { "files": ["a", "b"] } + { "files": ["c"] } = { "files": ["c"] }
+            targets+=($(jq -c ".repositories[] | $defaults + ." $config))
+            echo "::endgroup::"
+          done
+          batches=$(jq -sc "[. | _nwise($MAX_REPOS_PER_WORKFLOW)] | to_entries" <<< "${targets[@]}")
+          echo "batches=$batches" >> $GITHUB_OUTPUT
+  dispatch:
+    needs: [ matrix ]
+    name: Dispatch copy workflow(batch ${{ matrix.cfg.key }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # We end up with multiple "dispatch" jobs,
+        # one per BATCHES "key" chunk above with a "value" array.
+        # For each "dispatch" job, matrix.cfg.value is an array, like:
+        #
+        #   [
+        #     {"target": "repo1", "files": [".github/workflows/go-check.yml"]},
+        #     {"target": "repo2", "files": [".github/workflows/go-check.yml", ".github/workflows/go-test.yml"]}
+        #   ]
+        #
+        # The triggered copy workflow runs use that final array as their matrix.
+        # Since max-parallel here is 1, we'll end up with at most max-parallel from copy workflow + 1 parallel jobs.
+        # 20 is the upper limit on parallel jobs on a free plan.
+        cfg: ${{ fromJSON(needs.matrix.outputs.batches) }}
+      max-parallel: 1
+    env:
+      GITHUB_TOKEN: ${{ secrets.WEB3_BOT_GITHUB_TOKEN }}
+      WORKFLOW_YML: copy-workflow.yml
+      WORKFLOW_REPO: protocol/.github
+    steps:
+      - id: dispatch
+        name: Dispatch copy workflow
+        env:
+          TARGETS: ${{ toJSON(matrix.cfg.value) }}
+        run: |
+          start_date="$(date +%s)"
+          gh workflow run "$WORKFLOW_YML" --ref "$GITHUB_REF" --repo "$WORKFLOW_REPO" --field "targets=$TARGETS"
+          echo "start_date=$start_date" >> $GITHUB_OUTPUT
+      - id: run
+        name: Wait for copy workflow run to start
+        env:
+          START_DATE: ${{ steps.dispatch.outputs.start_date }}
+        run: |
+          # checks every 3 seconds until the most recent copy workflow run's created_at is later than this job's start_date
+          while sleep 3; do
+            run="$(gh api "/repos/$WORKFLOW_REPO/actions/workflows/$WORKFLOW_YML/runs?per_page=1" --jq '.workflow_runs[0]')"
+            # nothing to check if no copy workflow run was returned
+            if [[ ! -z "$run" ]]; then
+              run_start_date="$(date --date="$(jq -r '.created_at' <<< "$run")" +%s)"
+              if [[ "$run_start_date" > "$START_DATE" ]]; then
+                echo "id=$(jq -r '.id' <<< "$run")" >> $GITHUB_OUTPUT
+                break
+              fi
+            fi
+          done
+      - name: Wait for copy workflow run to complete
+        env:
+          RUN_ID: ${{ steps.run.outputs.id }}
+        run: |
+          # delays checking copy workflow's run status to save on GH API requests
+          sleep $WORKFLOW_COMPLETION_CHECK_DELAY
+
+          # checks every 3 seconds until the copy workflow run's status is completed
+          # redirects the stdout to /dev/null because it is very chatty
+          gh run watch "$RUN_ID" --repo "$WORKFLOW_REPO" > /dev/null
