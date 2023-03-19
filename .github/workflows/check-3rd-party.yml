@@ -1,0 +1,32 @@
+on:
+  pull_request:
+    paths-ignore:
+      - 'configs/*.json'
+
+name: Check 3rd Party
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.set-matrix.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v3
+      - id: set-matrix
+        run: |
+          TARGETS=$(find . -type f -name "*.yml" | sed "s|^\./||" | grep -v workflow-templates/header.yml | jq -R -s -c 'split("\n")[:-1]')
+          echo "targets=$TARGETS" >> $GITHUB_OUTPUT
+  check:
+    needs: [ matrix ]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJSON(needs.matrix.outputs.targets) }}
+    name: ${{ matrix.file }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run check
+        env:
+          FILE: ${{ matrix.file }}
+        run: .github/workflows/check-3rd-party.sh $FILE
