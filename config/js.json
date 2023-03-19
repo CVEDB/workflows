@@ -1,8 +1,8 @@
 {
   "defaults": {
     "files": [
-      "CVEDB/workflows/automerge.yml",
-      "CVEDB/workflows/js-test-and-release.yml"
+      ".github/workflows/automerge.yml",
+      ".github/workflows/js-test-and-release.yml"
     ]
   },
   "repositories": [
